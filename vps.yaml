@@ -1,0 +1,304 @@
+---
+- hosts: all
+  become: true
+  gather_facts: no # skip fact gathering to save time
+  tasks:
+    # utilities
+    - name: pull
+      tags:
+        pull
+      shell:
+        cmd: "docker pull {{remote}}"
+      when:
+        remote is defined
+    - name: disk usage
+      tags:
+        df
+      shell:
+        cmd: df -hl ~ --output=pcent,avail| tail -n 1
+      register: out
+    - name: cat file
+      tags:
+        cat
+      shell:
+        cmd: "cat {{remote}}"
+      when:
+        remote is defined
+      register: out
+    - name: get file
+      tags:
+        get
+      fetch:
+        dest: "{{ local }}"
+        src: "{{ remote }}"
+        flat: yes
+      when:
+        local is defined and remote is defined
+
+    # setup k3s dependencies
+    - name: Setup k3s nodes
+      tags: setup
+      block:
+      - name: Install docker
+        block:
+          - name: Install docker dependencies
+            apt:
+              pkg:
+                - apt-transport-https
+                - ca-certificates
+                - curl
+                - software-properties-common
+                - python3-pip
+                - virtualenv
+                - python3-setuptools
+                - jq
+              update_cache: true
+          - name: Add docker key and source
+            shell: |
+              mkdir -p /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor > /etc/apt/keyrings/docker.gpg
+              echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+          - name: Install docker with apt
+            apt:
+              pkg:
+                - docker-ce
+                - docker-ce-cli
+                - containerd.io
+              state: latest
+              update_cache: true
+
+      - name: Install NFS and IPVS
+        apt:
+          pkg:
+            - nfs-kernel-server
+            - ipset
+            - ipvsadm
+          state: latest
+          update_cache: true
+      - name: Install k3sup
+        shell: |
+          curl -sLS https://get.k3sup.dev | sh
+    - name: Setup k3s server
+      tags: setup-server
+      block:
+      - name: Install k3sup
+        shell: |
+          curl -sLS https://get.k3sup.dev | sh
+      - name: Install NFS server
+        apt:
+          pkg:
+            - nfs-kernel-server
+          state: latest
+          update_cache: true
+      - name: Setup NFS Server
+        block:
+          - name: edit /etc/exports
+            loop: "{{ groups['all'] }}"
+            # only insert if the line doesn't exist
+            lineinfile:
+              path: "/etc/exports"
+              line: "/home/nfsshare {{ hostvars[item]['ansible_ssh_host'] }}(rw,no_root_squash)"
+          - name: reload nfs-kernel-server
+            shell:
+              cmd: service nfs-kernel-server reload
+
+    # update server
+    - name: Update server on new nodes
+      tags: update-server
+      block:
+        - name: edit /etc/exports
+          loop: "{{ groups['all'] }}"
+          # only insert if the line doesn't exist
+          lineinfile:
+            path: "/etc/exports"
+            line: "/home/nfsshare {{ hostvars[item]['ansible_ssh_host'] }}(rw,no_root_squash)"
+        - name: reload nfs-kernel-server
+          shell:
+            cmd: service nfs-kernel-server reload
+
+    # install k3s
+    - name: Install k3s server
+      tags: install-server
+      block:
+        - name: add public key
+          lineinfile:
+            path: ~/.ssh/authorized_keys
+            line: "{{lookup('file', 'k3s.pub')}}"
+            create: yes
+            state: present
+        - name: send private key
+          copy:
+            src: k3s
+            dest: ~/.ssh/id_rsa
+        - name: install k3s server
+          shell:
+            cmd: "k3sup install --ip {{ ansible_ssh_host }} --ssh-port {{ ansible_ssh_port }} --user root --k3s-extra-args '--disable traefik --disable servicelb --docker -kube-proxy-arg proxy-mode=ipvs'"
+        - name: setup nfs client volume provisioner
+          block:
+            - name: install helm
+              shell: |
+                curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+                chmod +x get_helm.sh
+                ./get_helm.sh
+            - name: label node
+              shell: |
+                name=$(kubectl get nodes -o json | jq -r '.items[] | select (.status.addresses[].address | contains("{{ ansible_ssh_host }}")) | .metadata.name')
+                kubectl label node $name myrole=master
+            - name: install nfs-client volume provisioner
+              shell: |
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+                helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+                helm install -n kube-system nfs-subdir-external-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner --set nfs.server={{ ansible_ssh_host }} --set nfs.path=/home/nfsshare/ --set nodeSelector.myrole=master
+    - name: Install k3s agent
+      tags: install-agent
+      block:
+        - name: add public key
+          lineinfile:
+            path: ~/.ssh/authorized_keys
+            line: "{{lookup('file', 'k3s.pub')}}"
+            create: yes
+            state: present
+        - name: send private key
+          copy:
+            src: k3s
+            dest: ~/.ssh/id_rsa
+        - name: install k3s agent
+          shell:
+            cmd: "k3sup join --ip {{ ansible_ssh_host }} --ssh-port {{ ansible_ssh_port if ansible_ssh_port is defined else 22 }} --user root --server-ip {{ hostvars[server]['ansible_ssh_host'] }} --server-ssh-port {{ server_port if server_port is defined else 22 }} --k3s-extra-args '--docker -kube-proxy-arg proxy-mode=ipvs --node-name {{ inventory_hostname }}'"
+          when:
+            server is defined and server_port is defined
+    - name: Uninstall k3s
+      tags: uninstall-k3s
+      block:
+        - name: killall
+          shell: |
+            which k3s-killall.sh && k3s-killall.sh || echo
+        - name: uninstall
+          shell: |
+            which k3s-uninstall.sh && k3s-uninstall.sh || which k3s-agent-uninstall.sh && k3s-agent-uninstall.sh || echo
+    # install mysql
+    - name: Install and setup mysql
+      tags: mysql
+      block:
+      - name: mysql password
+        debconf:
+          name: mysql-server
+          question: mysql-server/root_password
+          value: "{{ password }}"
+          vtype: password
+      - name: mysql password again
+        debconf:
+          name: mysql-server
+          question: mysql-server/root_password_again
+          value: "{{ password }}"
+          vtype: password
+      - name: install mysql
+        apt:
+          pkg:
+            - mysql-server
+          state: latest
+          update_cache: true
+      - name: allow remote access
+        lineinfile:
+          path: "/etc/mysql/mysql.conf.d/mysqld.cnf"
+          regexp: '^bind-address.*='
+          line: "bind-address\t= 0.0.0.0"
+      - name: add whitelist
+        expect:
+          command: /bin/bash -c "echo \"CREATE USER IF NOT EXISTS '{{ username }}'@'%' IDENTIFIED BY '{{ password }}'; GRANT ALL PRIVILEGES ON *.* TO '{{ username }}'@'%' WITH GRANT OPTION; CREATE DATABASE IF NOT EXISTS airflow;\" | mysql -u root -p"
+          responses:
+            (?!)password: "{{ password }}"
+      - name: create database
+        expect:
+          command: /bin/bash -c "echo \"CREATE DATABASE IF NOT EXISTS airflow;\" | mysql -u root -p"
+          responses:
+            (?!)password: "{{ password }}"
+      - name: restart mysql server
+        shell:
+          cmd: service mysql restart
+      when:
+        password is defined and username is defined
+    # install redis
+    - name: Install and setup redis
+      tags: redis
+      block:
+      - name: install redis
+        apt:
+          pkg:
+            - redis
+          state: latest
+          update_cache: true
+      - name: allow remote access
+        lineinfile:
+          path: "/etc/redis/redis.conf"
+          regexp: '^bind .*'
+          line: "bind 0.0.0.0"
+      - name: set password
+        lineinfile:
+          path: "/etc/redis/redis.conf"
+          regexp: '^requirepass .*'
+          line: "requirepass {{ password }}"
+      - name: restart redis server
+        shell:
+          cmd: service redis-server restart
+      - name: get redis password
+        shell:
+          cmd: grep -oP '^requirepass \K.*' /etc/redis/redis.conf
+        register: out
+    # install harbor
+    - name: Install harbor
+      tags: harbor
+      when:
+        cwd is defined
+      block:
+        - name: Install docker dependencies
+          apt:
+            pkg:
+              - apt-transport-https
+              - ca-certificates
+              - curl
+              - software-properties-common
+              - python3-pip
+              - virtualenv
+              - python3-setuptools
+              - jq
+            update_cache: true
+        - name: Add docker key and source
+          shell: |
+            mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor > /etc/apt/keyrings/docker.gpg
+            echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+        - name: Install docker with apt
+          apt:
+            pkg:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-compose-plugin
+            state: latest
+            update_cache: true
+        - name: Install docker compose
+          shell: |
+            curl -L "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+        - name: Get docker compose version
+          shell:
+            cmd: docker-compose --version
+          register: out
+        - name: Install harbor with docker compose
+          shell:
+            cmd: |
+              curl -LO https://raw.githubusercontent.com/bitnami/containers/main/bitnami/harbor-portal/docker-compose.yml
+              curl -L https://github.com/bitnami/containers/archive/main.tar.gz | tar xz --strip=2 containers-main/bitnami/harbor-portal && cp -RL harbor-portal/config . && rm -rf harbor-portal
+              docker-compose up
+            chdir: "{{ cwd }}"
+  post_tasks:
+    - name: print
+      debug:
+        msg: "{{ out.stdout }}"
+      when: out is defined
+      tags: always

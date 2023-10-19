@@ -1,0 +1,24 @@
+{
+    "monitors": [
+        "sg-0001",
+        "jp-0001"
+    ],
+    "target": {
+        "list": [
+            "1.1.1.1/18",
+            "8.8.8.8/18"
+        ],
+        "file": "/opt/data/debug.txt",
+        "split": true,
+        "sample": {
+            "type": "UNIFORM",
+            "density": 24
+        }
+    },
+    "method": "udp",
+    "firstHop": 1,
+    "gap": 5,
+    "attempts": 1,
+    "pps": 100,
+    "dealias": true
+}
